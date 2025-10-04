@@ -76,9 +76,12 @@ class HybridTradingBacktest:
 
             # Calcular timestamp de inicio (días atrás)
             import time
-            start_timestamp = int((pd.Timestamp.now() - pd.Timedelta(days=days)).timestamp() * 1000)
             
-            # Si necesitamos menos que el límite por petición, descarga directa
+            start_timestamp = int((pd.Timestamp.now() - pd.Timedelta(days=days)).timestamp() * 1000)
+            #mostramos la fecha de inicio
+            # Mostrar la fecha de inicio en AR
+            start_dt = pd.to_datetime(start_timestamp, unit='ms', utc=True).tz_convert('America/Argentina/Buenos_Aires')
+            print(f"Fecha de inicio: {start_dt}")            # Si necesitamos menos que el límite por petición, descarga directa
             if total_candles_needed <= max_per_request:
                 logger.info(f"Descargando {total_candles_needed} velas en una sola petición...")
                 ohlcv = self.exchange.fetch_ohlcv(
@@ -874,7 +877,7 @@ def main():
     symbol = 'HYPE/USDT'
     initial_balance = 1000  # Balance inicial en USDT
     risk_per_trade = 0.10  # 10% del capital por trade
-    days = 215  # Días de historia que quieres probar
+    days = 400  # Días de historia que quieres probar
     
     print("="*70)
     print("📊 BACKTEST FUTUROS 5X - HYPE/USDT")
