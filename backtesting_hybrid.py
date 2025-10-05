@@ -20,7 +20,7 @@ class HybridTradingBacktest:
         """
         Inicializar backtesting - Estrategia Mean Reversion Bidireccional
         LONGs: Mean Reversion en sobreventa
-        SHORTs: Mean Reversion en sobrecompra
+        SHORTs: Mean Reversion en sobrecompra MEJORADO
         
         Args:
             symbol: Par de trading
@@ -41,14 +41,23 @@ class HybridTradingBacktest:
         # Apalancamiento
         self.leverage = 15
         
-        self.stop_loss_percent = 0.012
-        self.take_profit_percent = 0.03
+        # Stops y TPs asimétricos
+        self.stop_loss_percent_long = 0.012   # 1.2% para LONGs
+        self.stop_loss_percent_short = 0.015  # 1.5% para SHORTs
+        
+        self.take_profit_percent_long = 0.03   # 3% para LONGs
+        self.take_profit_percent_short = 0.022 # 2.2% para SHORTs (más conservador)
+        
+        # Límites de tiempo diferenciados
+        self.max_candles_long = 60   # 5 horas para LONGs
+        self.max_candles_short = 45  # 3.75 horas para SHORTs
         
         # Historial de trades
         self.trades = []
         self.equity_curve = []
         # Estadísticas adicionales
         self.filtered_long_signals = 0  # Señales LONG fuera de horario
+        self.filtered_short_signals = 0  # Señales SHORT rechazadas por calidad
         
         # Datos
         self.df = None
@@ -78,10 +87,11 @@ class HybridTradingBacktest:
             import time
             
             start_timestamp = int((pd.Timestamp.now() - pd.Timedelta(days=days)).timestamp() * 1000)
-            #mostramos la fecha de inicio
             # Mostrar la fecha de inicio en AR
             start_dt = pd.to_datetime(start_timestamp, unit='ms', utc=True).tz_convert('America/Argentina/Buenos_Aires')
-            print(f"Fecha de inicio: {start_dt}")            # Si necesitamos menos que el límite por petición, descarga directa
+            print(f"Fecha de inicio: {start_dt}")
+            
+            # Si necesitamos menos que el límite por petición, descarga directa
             if total_candles_needed <= max_per_request:
                 logger.info(f"Descargando {total_candles_needed} velas en una sola petición...")
                 ohlcv = self.exchange.fetch_ohlcv(
@@ -101,7 +111,7 @@ class HybridTradingBacktest:
                 logger.info(f"✅ Datos descargados: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
                 return df
 
-            # Si necesitamos más de 500, descargar en chunks desde el pasado
+            # Si necesitamos más de 1000, descargar en chunks desde el pasado
             logger.info(f"⚠️  Necesitamos más de {max_per_request} velas. Descargando en múltiples peticiones...")
 
             all_data = []
@@ -264,72 +274,105 @@ class HybridTradingBacktest:
 
         return sum(oversold_conditions) >= 5
     
-    def detect_smc_long(self, idx: int, lookback: int = 30) -> bool:
+    def detect_mean_reversion_short_improved(self, idx: int) -> bool:
         """
-        DEPRECADO - Ahora usamos mean_reversion_long
-        """
-        return False
-    
-    def detect_mean_reversion_short(self, idx: int) -> bool:
-        """
-        Detectar señal SHORT usando Mean Reversion ULTRA MEJORADO (sobrecompra)
-        
-        Mejoras v2:
-        1. RSI más estricto (>72)
-        2. Confirmación de vela bajista (rechazo)
-        3. Volumen significativo
-        4. Precio extendido desde EMA 50
-        5. Requiere 7 de 9 condiciones
+        Detectar señal SHORT MEJORADO - Versión MÁS PERMISIVA
         """
         if idx < 200:
             return False
         
         current = self.df.iloc[idx]
         prev = self.df.iloc[idx - 1]
-        prev2 = self.df.iloc[idx - 2]
         recent = self.df.iloc[max(0, idx-20):idx]
+        recent_longer = self.df.iloc[max(0, idx-50):idx]
         
-        # CONDICIÓN CRÍTICA 1: Precio cerca de resistencia (BB upper)
-        at_resistance = current['close'] > current['bb_upper'] * 0.995
-        
-        if not at_resistance:
-            return False
-        
-        # CONDICIÓN CRÍTICA 2: Vela de rechazo (patrón bajista) - MÁS FLEXIBLE
-        # Vela actual debe cerrar en el 50% inferior de su rango O ser bajista
-        candle_range = current['high'] - current['low']
-        if candle_range > 0:
-            close_position = (current['close'] - current['low']) / candle_range
-            has_rejection = (close_position < 0.5) or (current['close'] < current['open'])
-        else:
-            has_rejection = current['close'] < current['open']
-        
-        if not has_rejection:
-            return False
-        
-        # Detectar sobrecompra con confirmaciones BALANCEADAS
-        overbought_conditions = [
-            current['ema_9'] > current['ema_21'],          # Tendencia alcista corto plazo
-            current['ema_21'] > current['ema_50'],         # Tendencia alcista medio plazo
-            current['close'] > current['ema_9'],           # Precio arriba de EMA rápida
-            current['rsi'] > 68,                           # RSI alto (sobrecompra)
-            current['macd'] > current['macd_signal'],      # MACD alcista
-            current['macd_hist'] > prev['macd_hist'],      # Momentum alcista creciendo
-            current['volume'] > recent['volume'].mean() * 1.2,  # Volumen presente
-            current['close'] > current['ema_50'] * 1.01,   # Precio 1% arriba de EMA 50
-            current['high'] > prev['high']                 # Nuevo máximo (exhaustión)
+        # FILTRO 1: Contexto alcista (MÁS FLEXIBLE)
+        uptrend_context = [
+            current['ema_9'] > current['ema_21'],
+            current['close'] > current['ema_50'],
+            recent_longer['close'].iloc[-1] > recent_longer['close'].iloc[0]
         ]
         
-        return sum(overbought_conditions) >= 6  # Balanceado: 6 de 9
+        # Solo requiere 1 de 3 (antes era 2 de 3)
+        if sum(uptrend_context) < 1:
+            self.filtered_short_signals += 1
+            return False
+        
+        # CONDICIÓN CRÍTICA: Precio cerca de BB upper (MÁS PERMISIVO)
+        bb_distance = (current['close'] - current['bb_upper']) / current['bb_upper'] * 100
+        near_bb_upper = bb_distance > -1.0  # Puede estar hasta 1% debajo (antes -0.5%)
+        
+        if not near_bb_upper:
+            return False
+        
+        # PATRÓN DE VELA: MÁS FLEXIBLE
+        candle_range = current['high'] - current['low']
+        if candle_range == 0:
+            return False
+        
+        close_position = (current['close'] - current['low']) / candle_range
+        
+        # Acepta cualquier vela que no cierre en el 70% superior
+        has_bearish_pattern = close_position < 0.7  # Antes era 0.6
+        
+        if not has_bearish_pattern:
+            return False
+        
+        volume_mean = recent['volume'].mean()
+        
+        # CONDICIONES MÁS PERMISIVAS
+        short_conditions = [
+            current['rsi'] > 65,                                      # Bajado de 70
+            bb_distance > -0.8,                                       # Más permisivo
+            current['close'] > current['ema_9'],                      
+            current['macd'] > current['macd_signal'],                 
+            current['macd_hist'] < prev['macd_hist'],                 
+            current['volume'] > volume_mean * 1.05,                   # Bajado de 1.15
+            current['high'] >= recent['high'].tail(10).max(),         # Solo últimas 10 velas
+            (current['close'] - current['ema_50']) / current['ema_50'] * 100 > 0.5  # Bajado de 1.0
+        ]
+        
+        score = sum(short_conditions)
+        
+        # Requiere 4 de 8 (antes era 5 de 8)
+        return score >= 4
+
+    def add_short_quality_filter(self, idx: int) -> bool:
+        """
+        Filtro de calidad SIMPLIFICADO - Menos restrictivo
+        """
+        if idx < 10:
+            return True
+        
+        recent = self.df.iloc[max(0, idx-10):idx]
+        
+        # Solo filtrar casos EXTREMOS:
+        
+        # 1. Cruce alcista muy reciente (solo últimas 3 velas)
+        for i in range(max(0, len(recent) - 3), len(recent)):
+            if i < len(recent) - 1:
+                if recent['ema_9'].iloc[i] < recent['ema_21'].iloc[i] and \
+                recent['ema_9'].iloc[i+1] >= recent['ema_21'].iloc[i+1]:
+                    self.filtered_short_signals += 1
+                    return False
+        
+        # 2. Solo filtrar volumen EXTREMADAMENTE explosivo
+        volumes = recent['volume'].tail(3).values
+        if len(volumes) >= 3:
+            if volumes[-1] > volumes[-2] * 2.0 and volumes[-2] > volumes[-3] * 2.0:
+                self.filtered_short_signals += 1
+                return False
+        
+        # Eliminamos el filtro de mínimos ascendentes (era muy restrictivo)
+        
+        return True
     
     def analyze_market_direction(self, idx: int) -> str:
         """
         Analizar mercado usando Estrategia Híbrida de Mean Reversion
         
         LONGs: Mean Reversion en sobreventa (Lun-Vie 8:00-20:00)
-        SHORTs: Mean Reversion en sobrecompra (24/7)
-        
-        Ambas estrategias ahora son simétricas y consistentes
+        SHORTs: Mean Reversion en sobrecompra MEJORADO (24/7)
         
         Args:
             idx: Índice de la vela a analizar
@@ -347,57 +390,60 @@ class HybridTradingBacktest:
                 self.filtered_long_signals += 1
                 return None
         
-        # Detectar Mean Reversion SHORT (sobrecompra)
-        if self.detect_mean_reversion_short(idx):
+        # Detectar Mean Reversion SHORT MEJORADO (sobrecompra)
+        if self.detect_mean_reversion_short_improved(idx) and self.add_short_quality_filter(idx):
             return 'SHORT'
         
         return None
     
-    def calculate_stop_loss(self, entry_price: float, direction: str) -> float:
+    def calculate_stop_loss(self, entry_price: float, direction: str, idx: int = None) -> float:
         """
-        Calcular stop loss al 1.5% (ajustado para futuros con 5x)
+        Calcular stop loss asimétrico
+        LONGs: 1.2%
+        SHORTs: 1.5%
         """
-        stop_distance = entry_price * self.stop_loss_percent
-        
         if direction == 'LONG':
+            stop_distance = entry_price * self.stop_loss_percent_long
             return entry_price - stop_distance
         else:
+            stop_distance = entry_price * self.stop_loss_percent_short
             return entry_price + stop_distance
     
     def calculate_liquidation_price(self, entry_price: float, direction: str) -> float:
         """
-        Calcular precio de liquidación aproximado con apalancamiento 5x
-        Liquidación ocurre cuando pérdidas = 100% del margen (20% del precio)
+        Calcular precio de liquidación aproximado con apalancamiento 15x
+        Liquidación ocurre cuando pérdidas = 100% del margen
         """
         liquidation_distance = entry_price * (1 / self.leverage)
         
         if direction == 'LONG':
-            return entry_price - liquidation_distance  # -20%
+            return entry_price - liquidation_distance
         else:
-            return entry_price + liquidation_distance  # +20%
+            return entry_price + liquidation_distance
     
     def calculate_take_profit(self, entry_price: float, direction: str, 
                             is_first_trade: bool, idx: int) -> float:
         """
-        Calcular take profit al 4.5% (R:R 1:3)
-        Con apalancamiento 5x, esto representa un movimiento del precio del 4.5%
-        pero una ganancia del 22.5% sobre el margen
+        Calcular take profit asimétrico
+        LONGs: 3.0%
+        SHORTs: 2.2% (más conservador)
         """
-        tp_distance = entry_price * self.take_profit_percent
-        
         if direction == 'LONG':
+            tp_distance = entry_price * self.take_profit_percent_long
             return entry_price + tp_distance
         else:
+            tp_distance = entry_price * self.take_profit_percent_short
             return entry_price - tp_distance
     
     def simulate_trade(self, entry_idx: int, direction: str, entry_price: float,
                       stop_loss: float, take_profit: float, position_size: float) -> Dict:
         """
         Simular un trade de FUTUROS desde la entrada hasta la salida
-        Incluye verificación de liquidación con apalancamiento 5x
+        Incluye verificación de liquidación con apalancamiento 15x
         
-        LÍMITE DE TIEMPO: Si no alcanza TP/SL en 60 velas (5 horas en 5m),
-        cierra el trade automáticamente al precio actual
+        LÍMITE DE TIEMPO diferenciado:
+        - LONGs: 60 velas (5 horas)
+        - SHORTs: 45 velas (3.75 horas)
         
         Returns:
             Dict con información del trade
@@ -405,8 +451,8 @@ class HybridTradingBacktest:
         # Calcular precio de liquidación
         liquidation_price = self.calculate_liquidation_price(entry_price, direction)
         
-        # Límite de tiempo: máximo 60 velas (~5 horas en 5m)
-        max_candles = 60
+        # Límite de tiempo diferenciado
+        max_candles = self.max_candles_long if direction == 'LONG' else self.max_candles_short
         end_idx = min(entry_idx + max_candles, len(self.df) - 1)
         
         # Buscar salida en las siguientes velas
@@ -440,7 +486,6 @@ class HybridTradingBacktest:
                 if candle['low'] <= stop_loss:
                     exit_price = stop_loss
                     exit_reason = 'Stop Loss'
-                    # Con 5x: pérdida del 1.5% en precio = 7.5% del margen
                     pnl = (exit_price - entry_price) * position_size
                     return {
                         'entry_time': self.df.index[entry_idx],
@@ -462,7 +507,6 @@ class HybridTradingBacktest:
                 if candle['high'] >= take_profit:
                     exit_price = take_profit
                     exit_reason = 'Take Profit'
-                    # Con 5x: ganancia del 4.5% en precio = 22.5% del margen
                     pnl = (exit_price - entry_price) * position_size
                     return {
                         'entry_time': self.df.index[entry_idx],
@@ -552,8 +596,8 @@ class HybridTradingBacktest:
         
         # Determinar razón de salida
         if last_available_idx < len(self.df) - 1:
-            # Alcanzó límite de tiempo (60 velas)
-            exit_reason = 'Time Limit (5h)'
+            # Alcanzó límite de tiempo
+            exit_reason = 'Time Limit'
         else:
             # Fin de datos del backtest
             exit_reason = 'End of Data'
@@ -586,23 +630,17 @@ class HybridTradingBacktest:
         Args:
             risk_per_trade: Porcentaje del balance a usar por trade (default: 10%)
             days: Días de historia a analizar
-            
-        NOTA: Este backtest simula trading SIN apalancamiento.
-        Si usas apalancamiento 15x en el exchange:
-        - 20% del capital = posición de ~$3000 con $200 (si tienes $1000)
-        - El riesgo de liquidación es EXTREMADAMENTE ALTO
-        - Una vela del 0.67% en contra = liquidación total
         """
-        logger.info("=== BACKTEST FUTUROS 5X ===")
-        logger.info("Margen por trade: 20.0%")
-        logger.info("SL: 1.5% | TP: 4.5%")
-        logger.info("Límite de tiempo: 60 velas (5 horas)")
+        logger.info("=== BACKTEST FUTUROS 15X ===")
+        logger.info(f"Margen por trade: {risk_per_trade*100:.1f}%")
+        logger.info(f"SL Long: {self.stop_loss_percent_long*100}% | TP Long: {self.take_profit_percent_long*100}%")
+        logger.info(f"SL Short: {self.stop_loss_percent_short*100}% | TP Short: {self.take_profit_percent_short*100}%")
+        logger.info(f"Límite tiempo Long: {self.max_candles_long} velas | Short: {self.max_candles_short} velas")
         
         # Descargar datos
         self.df = self.fetch_historical_data(days)
         if self.df is None:
             return
-        
         # Calcular indicadores
         logger.info("Calculando indicadores...")
         self.df = self.calculate_indicators(self.df)
@@ -629,7 +667,7 @@ class HybridTradingBacktest:
                 
                 if direction:
                     entry_price = self.df.iloc[i]['close']
-                    stop_loss = self.calculate_stop_loss(entry_price, direction)
+                    stop_loss = self.calculate_stop_loss(entry_price, direction, i)
                     
                     # Verificar si es primer trade de la mañana
                     is_morning = current_time.time() < time(12, 0)
@@ -639,7 +677,7 @@ class HybridTradingBacktest:
                         entry_price, direction, is_first, i
                     )
                     
-                    # Calcular tamaño de posición para FUTUROS con 5x
+                    # Calcular tamaño de posición para FUTUROS con 15x
                     # Riesgo configurado como porcentaje del balance
                     margin = self.balance * risk_per_trade
                     # Posición total controlada (con apalancamiento)
@@ -664,8 +702,8 @@ class HybridTradingBacktest:
                     })
                     
                     # Log del trade
-                    logger.info(f"Trade #{len(self.trades)}: {direction} @ {entry_price:.2f} -> "
-                              f"{trade['exit_price']:.2f} | P/L: ${trade['pnl']:.2f} "
+                    logger.info(f"Trade #{len(self.trades)}: {direction} @ {entry_price:.4f} -> "
+                              f"{trade['exit_price']:.4f} | P/L: ${trade['pnl']:.2f} "
                               f"({trade['pnl_pct']:.2f}%) | {trade['exit_reason']}")
                     
                     # Marcar que ya no es el primer trade del día
@@ -715,7 +753,7 @@ class HybridTradingBacktest:
         
         # Imprimir resultados
         print("\n" + "="*60)
-        print("RESULTADOS FUTUROS 5X")
+        print("RESULTADOS FUTUROS 15X - ESTRATEGIA MEJORADA")
         print("="*60)
         print(f"\n📊 RESUMEN GENERAL")
         print(f"Balance Inicial:        ${self.initial_balance:.2f}")
@@ -733,6 +771,8 @@ class HybridTradingBacktest:
         print(f"\n💰 PROMEDIOS")
         print(f"Ganancia Avg:       ${avg_win:.2f}")
         print(f"Pérdida Avg:        ${avg_loss:.2f}")
+        print(f"Max Ganancia:       ${max_win:.2f}")
+        print(f"Max Pérdida:        ${max_loss:.2f}")
         
         print(f"\n📋 POR DIRECCIÓN")
         for direction in ['LONG', 'SHORT']:
@@ -749,16 +789,31 @@ class HybridTradingBacktest:
             pct = (count / total_trades) * 100
             print(f"{reason:20} - {count:2} ({pct:.2f}%)")
         
-        print(f"\n⏰ FILTRO LONGS")
+        print(f"\n⏰ FILTROS DE SEÑALES")
+        
+        # Filtro LONG
         long_trades_executed = len(trades_df[trades_df['direction'] == 'LONG'])
         total_long_signals = long_trades_executed + self.filtered_long_signals
         if total_long_signals > 0:
-            filter_rate = (self.filtered_long_signals / total_long_signals) * 100
-            print(f"Detectadas: {total_long_signals}")
-            print(f"Ejecutadas: {long_trades_executed} ({100-filter_rate:.1f}%)")
-            print(f"Filtradas:  {self.filtered_long_signals} ({filter_rate:.1f}%)")
+            filter_rate_long = (self.filtered_long_signals / total_long_signals) * 100
+            print(f"\nLONG (horario):")
+            print(f"  Detectadas: {total_long_signals}")
+            print(f"  Ejecutadas: {long_trades_executed} ({100-filter_rate_long:.1f}%)")
+            print(f"  Filtradas:  {self.filtered_long_signals} ({filter_rate_long:.1f}%)")
         else:
-            print(f"Sin señales LONG")
+            print(f"\nLONG: Sin señales detectadas")
+        
+        # Filtro SHORT
+        short_trades_executed = len(trades_df[trades_df['direction'] == 'SHORT'])
+        total_short_signals = short_trades_executed + self.filtered_short_signals
+        if total_short_signals > 0:
+            filter_rate_short = (self.filtered_short_signals / total_short_signals) * 100
+            print(f"\nSHORT (calidad):")
+            print(f"  Detectadas: {total_short_signals}")
+            print(f"  Ejecutadas: {short_trades_executed} ({100-filter_rate_short:.1f}%)")
+            print(f"  Filtradas:  {self.filtered_short_signals} ({filter_rate_short:.1f}%)")
+        else:
+            print(f"\nSHORT: Sin señales detectadas")
         
         print("\n" + "="*60)
         
@@ -769,9 +824,9 @@ class HybridTradingBacktest:
         """
         Guardar resultados detallados en CSV
         """
-        filename = f"backtest_futures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = f"backtest_futures_15x_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         trades_df.to_csv(filename, index=False)
-        logger.info(f"Guardado: {filename}")
+        logger.info(f"Resultados guardados en: {filename}")
     
     def plot_results(self):
         """
@@ -785,9 +840,15 @@ class HybridTradingBacktest:
         
         # Gráfico 1: Curva de Equity
         equity_df = pd.DataFrame(self.equity_curve)
-        axes[0].plot(equity_df['time'], equity_df['balance'], label='Balance', linewidth=2)
-        axes[0].axhline(y=self.initial_balance, color='gray', linestyle='--', label='Balance Inicial')
-        axes[0].set_title('Curva de Equity - Estrategia Híbrida', fontsize=14, fontweight='bold')
+        axes[0].plot(equity_df['time'], equity_df['balance'], label='Balance', linewidth=2, color='#2E86AB')
+        axes[0].axhline(y=self.initial_balance, color='gray', linestyle='--', label='Balance Inicial', alpha=0.7)
+        axes[0].fill_between(equity_df['time'], self.initial_balance, equity_df['balance'], 
+                            where=(equity_df['balance'] >= self.initial_balance), 
+                            interpolate=True, alpha=0.3, color='green')
+        axes[0].fill_between(equity_df['time'], self.initial_balance, equity_df['balance'], 
+                            where=(equity_df['balance'] < self.initial_balance), 
+                            interpolate=True, alpha=0.3, color='red')
+        axes[0].set_title('Curva de Equity - Estrategia Mean Reversion 15X', fontsize=14, fontweight='bold')
         axes[0].set_xlabel('Fecha')
         axes[0].set_ylabel('Balance (USDT)')
         axes[0].legend()
@@ -795,104 +856,70 @@ class HybridTradingBacktest:
         
         # Gráfico 2: Distribución de P/L
         trades_df = pd.DataFrame(self.trades)
-        colors = ['green' if x > 0 else 'red' for x in trades_df['pnl']]
-        axes[1].bar(range(len(trades_df)), trades_df['pnl'], color=colors, alpha=0.6)
-        axes[1].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        axes[1].set_title('P/L por Trade - Estrategia Híbrida', fontsize=14, fontweight='bold')
+        colors = ['#06A77D' if x > 0 else '#D62828' for x in trades_df['pnl']]
+        axes[1].bar(range(len(trades_df)), trades_df['pnl'], color=colors, alpha=0.7)
+        axes[1].axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+        axes[1].set_title('P/L por Trade', fontsize=14, fontweight='bold')
         axes[1].set_xlabel('Trade #')
         axes[1].set_ylabel('P/L (USDT)')
-        axes[1].grid(True, alpha=0.3)
+        axes[1].grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
         
         # Guardar gráfico
-        filename = f"backtest_hybrid_chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        filename = f"backtest_futures_15x_chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         logger.info(f"Gráfico guardado en: {filename}")
         
         plt.show()
-    # ==============================
-    # DESCARGA DE DATOS COMPLETOS
-    # ==============================
-    def get_full_historical_klines(symbol, interval, start_str, end_str=None):
-        """
-        Descarga TODO el histórico de velas entre start_str y end_str,
-        iterando de a 1000 velas por request.
-        """
-        all_klines = []
-        start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
-        end_ts = int(pd.to_datetime(end_str).timestamp() * 1000) if end_str else int(datetime.now().timestamp() * 1000)
-
-
-        while True:
-            klines = client.futures_klines(
-            symbol=symbol,
-            interval=interval,
-            startTime=start_ts,
-            endTime=end_ts,
-            limit=1000
-            )
-
-
-            if not klines:
-                break
-
-
-            all_klines.extend(klines)
-
-
-            last_open_time = klines[-1][0]
-            start_ts = last_open_time + 1
-
-
-            if start_ts >= end_ts:
-                break
-
-
-            time.sleep(0.2)
-
-
-            return all_klines
 
 
 def main():
     """
-    Función principal para ejecutar backtest híbrido
+    Función principal para ejecutar backtest híbrido mejorado
     
-    ⚠️ ADVERTENCIA IMPORTANTE SOBRE APALANCAMIENTO:
+    ⚠️ ADVERTENCIA IMPORTANTE SOBRE APALANCAMIENTO 15X:
     
-    Este backtest simula operaciones SIN apalancamiento (spot trading).
-    Usa 20% del capital por trade.
+    Este backtest simula operaciones con apalancamiento 15x.
     
-    Si planeas usar apalancamiento 15x en el exchange:
+    Configuración:
     - Balance: $1000
-    - Capital por trade: 20% = $200
-    - Con 15x: Controlarás una posición de $3,000
-    - Precio de liquidación: 0.67% en tu contra
-    - Con HYPE/USDT (muy volátil), las liquidaciones son MUY comunes
+    - Margen por trade: 10% = $100
+    - Con 15x: Posición de $1,500
+    - Precio de liquidación: ~6.67% en tu contra
     
-    RIESGO REAL: Una sola vela volátil puede liquidar tu cuenta completa.
+    RIESGO EXTREMO:
+    - Una vela del 6.67% en contra = liquidación total del margen
+    - Con HYPE/USDT (alta volatilidad), esto es COMÚN
+    - Múltiples liquidaciones pueden destruir tu cuenta rápidamente
+    
+    RECOMENDACIONES:
+    1. Considera usar apalancamiento 3-5x para reducir riesgo de liquidación
+    2. Usa stop loss más ajustados
+    3. Reduce el margen por trade (5-7% en lugar de 10%)
+    4. Prueba exhaustivamente en demo antes de usar dinero real
     """
     # Configuración
     symbol = 'HYPE/USDT'
     initial_balance = 1000  # Balance inicial en USDT
-    risk_per_trade = 0.10  # 10% del capital por trade
-    days = 400  # Días de historia que quieres probar
+    risk_per_trade = 0.10  # 10% del capital por trade (margen)
+    days = 120  # Días de historia para backtest
     
     print("="*70)
-    print("📊 BACKTEST FUTUROS 5X - HYPE/USDT")
+    print("📊 BACKTEST FUTUROS 15X - ESTRATEGIA MEAN REVERSION MEJORADA")
     print("="*70)
     print("Configuración:")
-    print("• Apalancamiento: 5x")
-    print("• Margen por trade: 20%")
-    print("• Stop Loss: 1.5% → ~7.5% del margen")
-    print("• Take Profit: 4.5% → ~22.5% del margen")
-    print("• Límite de tiempo: 60 velas (5 horas)")
-    print("• Liquidación: ±20%")
+    print("• Symbol: HYPE/USDT")
+    print("• Apalancamiento: 15x")
+    print("• Margen por trade: 10%")
+    print("• Stop Loss Long: 1.2% | Short: 1.5%")
+    print("• Take Profit Long: 3.0% | Short: 2.2%")
+    print("• Límite tiempo Long: 60 velas (5h) | Short: 45 velas (3.75h)")
+    print("• Liquidación: ±6.67%")
     print("")
-    print("Con $1000:")
-    print("• Margen: $200")
-    print("• Posición: $1,000")
+    print(f"Con ${initial_balance}:")
+    print(f"• Margen: ${initial_balance * risk_per_trade}")
+    print(f"• Posición: ${initial_balance * risk_per_trade * 15}")
     print("="*70 + "\n")
     
     # Crear instancia de backtest
@@ -911,3 +938,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
