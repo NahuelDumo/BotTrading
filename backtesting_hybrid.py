@@ -901,7 +901,7 @@ def main():
     """
     # Configuración
     symbol = 'HYPE/USDT'
-    initial_balance = 1000  # Balance inicial en USDT
+    initial_balance = 10  # Balance inicial en USDT
     risk_per_trade = 0.10  # 10% del capital por trade (margen)
     days = 120  # Días de historia para backtest
     
