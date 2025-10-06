@@ -7,6 +7,7 @@ import logging
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import xlsxwriter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -819,6 +820,7 @@ class HybridTradingBacktest:
         
         # Guardar resultados detallados
         self.save_detailed_results(trades_df)
+        self.save_excel_report(trades_df)
     
     def save_detailed_results(self, trades_df: pd.DataFrame):
         """
@@ -827,6 +829,279 @@ class HybridTradingBacktest:
         filename = f"backtest_futures_15x_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         trades_df.to_csv(filename, index=False)
         logger.info(f"Resultados guardados en: {filename}")
+    
+    def save_excel_report(self, trades_df: pd.DataFrame):
+        """
+        Guardar reporte completo en Excel con múltiples hojas y gráficos
+        """
+        filename = f"backtest_futures_15x_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        # Crear workbook
+        workbook = xlsxwriter.Workbook(filename)
+        
+        # Formatos
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#D3D3D3',
+            'border': 1
+        })
+        money_format = workbook.add_format({'num_format': '$#,##0.00'})
+        percent_format = workbook.add_format({'num_format': '0.00%'})
+        number_format = workbook.add_format({'num_format': '#,##0'})
+        
+        # Hoja 1: Resumen General
+        summary_sheet = workbook.add_worksheet('Resumen General')
+        
+        # Calcular métricas
+        total_trades = len(trades_df)
+        winning_trades = len(trades_df[trades_df['pnl'] > 0])
+        losing_trades = len(trades_df[trades_df['pnl'] < 0])
+        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+        
+        total_pnl = trades_df['pnl'].sum()
+        avg_win = trades_df[trades_df['pnl'] > 0]['pnl'].mean() if winning_trades > 0 else 0
+        avg_loss = trades_df[trades_df['pnl'] < 0]['pnl'].mean() if losing_trades > 0 else 0
+        
+        profit_factor = abs(trades_df[trades_df['pnl'] > 0]['pnl'].sum() / 
+                           trades_df[trades_df['pnl'] < 0]['pnl'].sum()) if losing_trades > 0 else 0
+        
+        max_win = trades_df['pnl'].max()
+        max_loss = trades_df['pnl'].min()
+        
+        # Calcular drawdown
+        equity_df = pd.DataFrame(self.equity_curve)
+        equity_df['cummax'] = equity_df['balance'].cummax()
+        equity_df['drawdown'] = equity_df['balance'] - equity_df['cummax']
+        equity_df['drawdown_pct'] = (equity_df['drawdown'] / equity_df['cummax']) * 100
+        max_drawdown = equity_df['drawdown_pct'].min()
+        
+        total_return = ((self.balance - self.initial_balance) / self.initial_balance) * 100
+        
+        # Escribir resumen
+        summary_data = [
+            ['Métrica', 'Valor'],
+            ['Balance Inicial', self.initial_balance],
+            ['Balance Final', self.balance],
+            ['P/L Total', total_pnl],
+            ['Retorno Total', total_return / 100],
+            ['Max Drawdown', max_drawdown / 100],
+            ['Total Trades', total_trades],
+            ['Trades Ganadores', winning_trades],
+            ['Trades Perdedores', losing_trades],
+            ['Win Rate', win_rate / 100],
+            ['Profit Factor', profit_factor],
+            ['Ganancia Promedio', avg_win],
+            ['Pérdida Promedio', avg_loss],
+            ['Max Ganancia', max_win],
+            ['Max Pérdida', max_loss]
+        ]
+        
+        for row, data in enumerate(summary_data):
+            summary_sheet.write(row, 0, data[0], header_format if row == 0 else None)
+            if isinstance(data[1], (int, float)):
+                if 'Balance' in data[0] or 'P/L' in data[0] or 'Ganancia' in data[0] or 'Pérdida' in data[0]:
+                    summary_sheet.write(row, 1, data[1], money_format)
+                elif 'Rate' in data[0] or 'Retorno' in data[0] or 'Drawdown' in data[0]:
+                    summary_sheet.write(row, 1, data[1], percent_format)
+                else:
+                    summary_sheet.write(row, 1, data[1], number_format)
+            else:
+                summary_sheet.write(row, 1, data[1])
+        
+        # Hoja 2: Desempeño por Días
+        daily_sheet = workbook.add_worksheet('Desempeño por Días')
+        
+        # Agrupar por fecha
+        trades_df['date'] = trades_df['entry_time'].dt.date
+        daily_performance = trades_df.groupby('date').agg({
+            'pnl': ['count', 'sum', lambda x: (x > 0).sum(), lambda x: (x < 0).sum()],
+        }).round(2)
+        daily_performance.columns = ['total_trades', 'total_pnl', 'winning_trades', 'losing_trades']
+        daily_performance['win_rate'] = (daily_performance['winning_trades'] / daily_performance['total_trades'] * 100).round(2)
+        daily_performance = daily_performance.reset_index()
+        
+        # Escribir headers
+        headers = ['Fecha', 'Total Trades', 'P/L Total', 'Trades Ganadores', 'Trades Perdedores', 'Win Rate %']
+        for col, header in enumerate(headers):
+            daily_sheet.write(0, col, header, header_format)
+        
+        # Escribir datos
+        for row, (_, data) in enumerate(daily_performance.iterrows(), 1):
+            daily_sheet.write(row, 0, str(data['date']))
+            daily_sheet.write(row, 1, data['total_trades'], number_format)
+            daily_sheet.write(row, 2, data['total_pnl'], money_format)
+            daily_sheet.write(row, 3, data['winning_trades'], number_format)
+            daily_sheet.write(row, 4, data['losing_trades'], number_format)
+            daily_sheet.write(row, 5, data['win_rate'] / 100, percent_format)
+        
+        # Gráfico de P/L diario
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'P/L Diario',
+            'categories': f"='Desempeño por Días'!$A$2:$A${len(daily_performance)+1}",
+            'values': f"='Desempeño por Días'!$C$2:$C${len(daily_performance)+1}",
+        })
+        chart.set_title({'name': 'P/L por Día'})
+        chart.set_x_axis({'name': 'Fecha'})
+        chart.set_y_axis({'name': 'P/L (USDT)'})
+        daily_sheet.insert_chart('H2', chart)
+        
+        # Hoja 3: Desempeño por Horas
+        hourly_sheet = workbook.add_worksheet('Desempeño por Horas')
+        
+        # Agrupar por hora
+        trades_df['hour'] = trades_df['entry_time'].dt.hour
+        hourly_performance = trades_df.groupby('hour').agg({
+            'pnl': ['count', 'sum', lambda x: (x > 0).sum(), lambda x: (x < 0).sum()],
+        }).round(2)
+        hourly_performance.columns = ['total_trades', 'total_pnl', 'winning_trades', 'losing_trades']
+        hourly_performance['win_rate'] = (hourly_performance['winning_trades'] / hourly_performance['total_trades'] * 100).round(2)
+        hourly_performance = hourly_performance.reset_index()
+        
+        # Escribir headers
+        headers = ['Hora', 'Total Trades', 'P/L Total', 'Trades Ganadores', 'Trades Perdedores', 'Win Rate %']
+        for col, header in enumerate(headers):
+            hourly_sheet.write(0, col, header, header_format)
+        
+        # Escribir datos
+        for row, (_, data) in enumerate(hourly_performance.iterrows(), 1):
+            hourly_sheet.write(row, 0, data['hour'], number_format)
+            hourly_sheet.write(row, 1, data['total_trades'], number_format)
+            hourly_sheet.write(row, 2, data['total_pnl'], money_format)
+            hourly_sheet.write(row, 3, data['winning_trades'], number_format)
+            hourly_sheet.write(row, 4, data['losing_trades'], number_format)
+            hourly_sheet.write(row, 5, data['win_rate'] / 100, percent_format)
+        
+        # Gráfico de P/L por hora
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'P/L por Hora',
+            'categories': f"='Desempeño por Horas'!$A$2:$A${len(hourly_performance)+1}",
+            'values': f"='Desempeño por Horas'!$C$2:$C${len(hourly_performance)+1}",
+        })
+        chart.set_title({'name': 'P/L por Hora'})
+        chart.set_x_axis({'name': 'Hora del Día'})
+        chart.set_y_axis({'name': 'P/L (USDT)'})
+        hourly_sheet.insert_chart('H2', chart)
+        
+        # Hoja 3.1: Desempeño por Día de Semana
+        weekday_sheet = workbook.add_worksheet('Desempeño por Día Semana')
+        
+        # Mapear números de día a nombres
+        day_names = {
+            0: 'Lunes',
+            1: 'Martes', 
+            2: 'Miércoles',
+            3: 'Jueves',
+            4: 'Viernes',
+            5: 'Sábado',
+            6: 'Domingo'
+        }
+        
+        # Agrupar por día de semana
+        trades_df['weekday'] = trades_df['entry_time'].dt.weekday
+        weekday_performance = trades_df.groupby('weekday').agg({
+            'pnl': ['count', 'sum', lambda x: (x > 0).sum(), lambda x: (x < 0).sum()],
+        }).round(2)
+        weekday_performance.columns = ['total_trades', 'total_pnl', 'winning_trades', 'losing_trades']
+        weekday_performance['win_rate'] = (weekday_performance['winning_trades'] / weekday_performance['total_trades'] * 100).round(2)
+        weekday_performance = weekday_performance.reset_index()
+        weekday_performance['day_name'] = weekday_performance['weekday'].map(day_names)
+        
+        # Escribir headers
+        headers = ['Día', 'Total Trades', 'P/L Total', 'Trades Ganadores', 'Trades Perdedores', 'Win Rate %']
+        for col, header in enumerate(headers):
+            weekday_sheet.write(0, col, header, header_format)
+        
+        # Escribir datos
+        for row, (_, data) in enumerate(weekday_performance.iterrows(), 1):
+            weekday_sheet.write(row, 0, data['day_name'])
+            weekday_sheet.write(row, 1, data['total_trades'], number_format)
+            weekday_sheet.write(row, 2, data['total_pnl'], money_format)
+            weekday_sheet.write(row, 3, data['winning_trades'], number_format)
+            weekday_sheet.write(row, 4, data['losing_trades'], number_format)
+            weekday_sheet.write(row, 5, data['win_rate'] / 100, percent_format)
+        
+        # Gráfico de P/L por día de semana
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'P/L por Día',
+            'categories': f"='Desempeño por Día Semana'!$A$2:$A${len(weekday_performance)+1}",
+            'values': f"='Desempeño por Día Semana'!$C$2:$C${len(weekday_performance)+1}",
+        })
+        chart.set_title({'name': 'P/L por Día de Semana'})
+        chart.set_x_axis({'name': 'Día de la Semana'})
+        chart.set_y_axis({'name': 'P/L (USDT)'})
+        weekday_sheet.insert_chart('H2', chart)
+        
+        # Hoja 4: Datos para Gráfico de Precios
+        chart_data_sheet = workbook.add_worksheet('Datos para Gráfico')
+        
+        # Preparar datos de velas con indicadores y trades
+        chart_df = self.df.copy()
+        chart_df = chart_df.reset_index()
+        
+        # Agregar columnas para trades
+        chart_df['trade_entry'] = None
+        chart_df['trade_exit'] = None
+        chart_df['direction'] = None
+        
+        # Marcar entradas y salidas
+        for trade in self.trades:
+            entry_idx = self.df.index.get_loc(trade['entry_time'])
+            exit_idx = self.df.index.get_loc(trade['exit_time'])
+            
+            chart_df.at[entry_idx, 'trade_entry'] = trade['entry_price']
+            chart_df.at[exit_idx, 'trade_exit'] = trade['exit_price']
+            chart_df.at[entry_idx, 'direction'] = trade['direction']
+        
+        # Escribir headers
+        headers = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'EMA9', 'EMA21', 'EMA50', 'EMA200', 'RSI', 'BB_Upper', 'BB_Lower', 'Trade_Entry', 'Trade_Exit', 'Direction']
+        for col, header in enumerate(headers):
+            chart_data_sheet.write(0, col, header, header_format)
+        
+        # Escribir datos (últimas 1000 velas para no hacer el archivo demasiado grande)
+        data_to_write = chart_df.tail(1000)
+        for row, (_, data) in enumerate(data_to_write.iterrows(), 1):
+            chart_data_sheet.write(row, 0, str(data['timestamp']))
+            chart_data_sheet.write(row, 1, data['open'])
+            chart_data_sheet.write(row, 2, data['high'])
+            chart_data_sheet.write(row, 3, data['low'])
+            chart_data_sheet.write(row, 4, data['close'])
+            chart_data_sheet.write(row, 5, data['volume'], number_format)
+            chart_data_sheet.write(row, 6, data.get('ema_9', 0))
+            chart_data_sheet.write(row, 7, data.get('ema_21', 0))
+            chart_data_sheet.write(row, 8, data.get('ema_50', 0))
+            chart_data_sheet.write(row, 9, data.get('ema_200', 0))
+            chart_data_sheet.write(row, 10, data.get('rsi', 0))
+            chart_data_sheet.write(row, 11, data.get('bb_upper', 0))
+            chart_data_sheet.write(row, 12, data.get('bb_lower', 0))
+            chart_data_sheet.write(row, 13, data['trade_entry'])
+            chart_data_sheet.write(row, 14, data['trade_exit'])
+            chart_data_sheet.write(row, 15, data['direction'])
+        
+        # Hoja 5: Todos los Trades
+        trades_sheet = workbook.add_worksheet('Todos los Trades')
+        
+        # Escribir trades_df
+        for col, header in enumerate(trades_df.columns):
+            trades_sheet.write(0, col, header, header_format)
+        
+        for row, (_, data) in enumerate(trades_df.iterrows(), 1):
+            for col, value in enumerate(data):
+                if pd.isna(value):
+                    trades_sheet.write(row, col, '')
+                elif isinstance(value, (int, float)) and 'pnl' in trades_df.columns[col]:
+                    trades_sheet.write(row, col, value, money_format)
+                elif isinstance(value, (int, float)) and 'pct' in trades_df.columns[col]:
+                    trades_sheet.write(row, col, value / 100, percent_format)
+                elif isinstance(value, (int, float)) and 'price' in trades_df.columns[col]:
+                    trades_sheet.write(row, col, value)
+                else:
+                    trades_sheet.write(row, col, str(value))
+        
+        workbook.close()
+        logger.info(f"Reporte Excel guardado en: {filename}")
     
     def plot_results(self):
         """
