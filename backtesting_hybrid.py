@@ -4,7 +4,7 @@ import numpy as np
 from datetime import datetime, time
 import json
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import xlsxwriter
@@ -106,7 +106,7 @@ class HybridTradingBacktest:
                     ohlcv,
                     columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
                 )
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert('America/Argentina/Buenos_Aires')
                 df.set_index('timestamp', inplace=True)
 
                 logger.info(f"✅ Datos descargados: {len(df)} velas desde {df.index[0]} hasta {df.index[-1]}")
@@ -160,7 +160,7 @@ class HybridTradingBacktest:
             # Eliminar duplicados (por si acaso)
             df = df.drop_duplicates(subset=['timestamp'])
 
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert('America/Argentina/Buenos_Aires')
             df.set_index('timestamp', inplace=True)
             df = df.sort_index()
 
@@ -180,6 +180,7 @@ class HybridTradingBacktest:
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         # EMA
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_15'] = df['close'].ewm(span=15, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
         df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
@@ -1176,7 +1177,7 @@ def main():
     """
     # Configuración
     symbol = 'HYPE/USDT'
-    initial_balance = 10  # Balance inicial en USDT
+    initial_balance = 100  # Balance inicial en USDT
     risk_per_trade = 0.10  # 10% del capital por trade (margen)
     days = 120  # Días de historia para backtest
     

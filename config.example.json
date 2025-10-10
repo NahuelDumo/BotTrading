@@ -1,0 +1,11 @@
+{
+  "api_key": "TU_API_KEY_BINANCE",
+  "api_secret": "TU_API_SECRET_BINANCE",
+  "telegram_token": "7738692166:AAHPBKWUVM8gcYldRojnFCWnOKwidfXL2cY",
+  "telegram_chat_id": "6670799737",
+  "symbol": "HYPE/USDT",
+  "initial_balance": 1000,
+  "leverage": 15,
+  "risk_per_trade": 0.10,
+  "refresh_seconds": 60
+}
