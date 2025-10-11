@@ -60,6 +60,14 @@ class HybridTradingBacktest:
         self.filtered_long_signals = 0  # Señales LONG fuera de horario
         self.filtered_short_signals = 0  # Señales SHORT rechazadas por calidad
         
+        # Parámetros para momentum trading
+        self.momentum_enabled = True
+        self.momentum_threshold_pct = 2.0  # Caída/subida de 2% en pocas velas
+        self.momentum_candles_window = 3  # Ventana de 3 velas para detectar momentum
+        self.momentum_volume_multiplier = 1.5  # Volumen 1.5x mayor que promedio
+        self.trailing_stop_activation_pct = 1.5  # Activar trailing después de 1.5% ganancia
+        self.trailing_stop_distance_pct = 0.8  # Trailing stop a 0.8% del máximo
+        
         # Datos
         self.df = None
         
@@ -369,6 +377,80 @@ class HybridTradingBacktest:
         
         return True
     
+    def detect_strong_momentum(self, idx: int) -> Optional[str]:
+        """Detecta caídas o subidas fuertes con volumen para entrar DURANTE el movimiento."""
+        if idx < 50:
+            return None
+        
+        current = self.df.iloc[idx]
+        recent = self.df.iloc[idx - self.momentum_candles_window:idx + 1]
+        volume_window = self.df.iloc[max(0, idx - 20):idx]
+        
+        # Calcular cambio de precio en la ventana
+        price_change_pct = ((current['close'] - recent['close'].iloc[0]) / recent['close'].iloc[0]) * 100
+        
+        # Volumen promedio
+        avg_volume = volume_window['volume'].mean()
+        current_volume = current['volume']
+        
+        # Verificar volumen fuerte
+        strong_volume = current_volume >= avg_volume * self.momentum_volume_multiplier
+        
+        # CAÍDA FUERTE (entrada LONG siguiendo la caída)
+        if price_change_pct <= -self.momentum_threshold_pct and strong_volume:
+            # Verificar que está cayendo activamente
+            bearish_candles = sum(1 for i in range(len(recent)) if recent['close'].iloc[i] < recent['open'].iloc[i])
+            if bearish_candles >= 2:
+                # NUEVA LÓGICA: Entrar DURANTE la caída, no esperar reversión
+                # Solo verificar que no está en rebote fuerte
+                if current['rsi'] < 45:  # Sobrevendido o neutral bajo
+                    # Verificar que la caída continúa (vela actual también bajista o neutral)
+                    if current['close'] <= recent['close'].iloc[-2]:  # Precio sigue bajando
+                        return 'LONG_MOMENTUM'
+        
+        # SUBIDA FUERTE (entrada SHORT siguiendo la subida)
+        elif price_change_pct >= self.momentum_threshold_pct and strong_volume:
+            # Verificar que está subiendo activamente
+            bullish_candles = sum(1 for i in range(len(recent)) if recent['close'].iloc[i] > recent['open'].iloc[i])
+            if bullish_candles >= 2:
+                # NUEVA LÓGICA: Entrar DURANTE la subida, no esperar reversión
+                if current['rsi'] > 55:  # Sobrecomprado o neutral alto
+                    # Verificar que la subida continúa
+                    if current['close'] >= recent['close'].iloc[-2]:  # Precio sigue subiendo
+                        return 'SHORT_MOMENTUM'
+        
+        return None
+    
+    def detect_momentum_reversal(self, idx: int, direction: str) -> bool:
+        """Detecta si el momentum se está revirtiendo para cerrar la posición."""
+        if idx < 1:
+            return False
+        
+        current = self.df.iloc[idx]
+        prev = self.df.iloc[idx - 1]
+        
+        if direction == 'LONG':
+            # Cerrar LONG si detecta reversión bajista
+            reversal_signals = [
+                current['close'] < current['ema_9'],  # Precio bajo EMA rápida
+                current['ema_9'] < current['ema_21'],  # Cruce bajista
+                current['macd_hist'] < prev['macd_hist'],  # MACD perdiendo fuerza
+                current['close'] < current['open'],  # Vela bajista
+                current['rsi'] > 65  # Sobrecomprado
+            ]
+            return sum(reversal_signals) >= 3
+        
+        else:  # SHORT
+            # Cerrar SHORT si detecta reversión alcista
+            reversal_signals = [
+                current['close'] > current['ema_9'],  # Precio sobre EMA rápida
+                current['ema_9'] > current['ema_21'],  # Cruce alcista
+                current['macd_hist'] > prev['macd_hist'],  # MACD ganando fuerza
+                current['close'] > current['open'],  # Vela alcista
+                current['rsi'] < 35  # Sobrevendido
+            ]
+            return sum(reversal_signals) >= 3
+    
     def analyze_market_direction(self, idx: int) -> str:
         """
         Analizar mercado usando Estrategia Híbrida de Mean Reversion
@@ -384,7 +466,13 @@ class HybridTradingBacktest:
         
         current_time = self.df.index[idx]
         
-        # Detectar Mean Reversion LONG (sobreventa)
+        # PRIORIDAD 1: Detectar momentum fuerte (sin restricción horaria)
+        if self.momentum_enabled:
+            momentum_signal = self.detect_strong_momentum(idx)
+            if momentum_signal:
+                return momentum_signal
+        
+        # PRIORIDAD 2: Detectar Mean Reversion LONG (sobreventa)
         if self.detect_mean_reversion_long(idx):
             if self.is_long_trading_hours(current_time):
                 return 'LONG'
@@ -392,7 +480,7 @@ class HybridTradingBacktest:
                 self.filtered_long_signals += 1
                 return None
         
-        # Detectar Mean Reversion SHORT MEJORADO (sobrecompra)
+        # PRIORIDAD 3: Detectar Mean Reversion SHORT MEJORADO (sobrecompra)
         if self.detect_mean_reversion_short_improved(idx) and self.add_short_quality_filter(idx):
             return 'SHORT'
         
@@ -438,7 +526,8 @@ class HybridTradingBacktest:
             return entry_price - tp_distance
     
     def simulate_trade(self, entry_idx: int, direction: str, entry_price: float,
-                      stop_loss: float, take_profit: float, position_size: float) -> Dict:
+                      stop_loss: float, take_profit: float, position_size: float, 
+                      entry_type: str = 'mean_reversion') -> Dict:
         """
         Simular un trade de FUTUROS desde la entrada hasta la salida
         Incluye verificación de liquidación con apalancamiento 15x
@@ -457,10 +546,129 @@ class HybridTradingBacktest:
         max_candles = self.max_candles_long if direction == 'LONG' else self.max_candles_short
         end_idx = min(entry_idx + max_candles, len(self.df) - 1)
         
+        # Variables para trailing stop (solo momentum)
+        trailing_stop = None
+        max_favorable_price = entry_price
+        
         # Buscar salida en las siguientes velas
         for i in range(entry_idx + 1, end_idx + 1):
             candle = self.df.iloc[i]
             
+            # Gestión especial para momentum
+            if entry_type == 'momentum':
+                current_price = candle['close']
+                
+                if direction == 'LONG':
+                    # Actualizar máximo alcanzado
+                    max_favorable_price = max(max_favorable_price, candle['high'])
+                    
+                    # Calcular ganancia actual
+                    profit_pct = ((current_price - entry_price) / entry_price) * 100
+                    
+                    # Activar trailing stop si hay ganancia suficiente
+                    if profit_pct >= self.trailing_stop_activation_pct:
+                        new_trailing = max_favorable_price * (1 - self.trailing_stop_distance_pct / 100)
+                        if trailing_stop is None or new_trailing > trailing_stop:
+                            trailing_stop = new_trailing
+                    
+                    # Verificar trailing stop
+                    if trailing_stop and candle['low'] <= trailing_stop:
+                        exit_price = trailing_stop
+                        pnl = (exit_price - entry_price) * position_size
+                        return {
+                            'entry_time': self.df.index[entry_idx],
+                            'exit_time': self.df.index[i],
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'liquidation_price': liquidation_price,
+                            'position_size': position_size,
+                            'pnl': pnl,
+                            'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
+                            'exit_reason': 'Trailing Stop (momentum)',
+                            'duration_candles': i - entry_idx,
+                            'entry_type': entry_type
+                        }
+                    
+                    # Verificar reversión de momentum
+                    if self.detect_momentum_reversal(i, direction):
+                        exit_price = current_price
+                        pnl = (exit_price - entry_price) * position_size
+                        return {
+                            'entry_time': self.df.index[entry_idx],
+                            'exit_time': self.df.index[i],
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'liquidation_price': liquidation_price,
+                            'position_size': position_size,
+                            'pnl': pnl,
+                            'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
+                            'exit_reason': 'Reversión de Momentum',
+                            'duration_candles': i - entry_idx,
+                            'entry_type': entry_type
+                        }
+                
+                else:  # SHORT
+                    # Actualizar mínimo alcanzado
+                    max_favorable_price = min(max_favorable_price, candle['low'])
+                    
+                    # Calcular ganancia actual
+                    profit_pct = ((entry_price - current_price) / entry_price) * 100
+                    
+                    # Activar trailing stop si hay ganancia suficiente
+                    if profit_pct >= self.trailing_stop_activation_pct:
+                        new_trailing = max_favorable_price * (1 + self.trailing_stop_distance_pct / 100)
+                        if trailing_stop is None or new_trailing < trailing_stop:
+                            trailing_stop = new_trailing
+                    
+                    # Verificar trailing stop
+                    if trailing_stop and candle['high'] >= trailing_stop:
+                        exit_price = trailing_stop
+                        pnl = (entry_price - exit_price) * position_size
+                        return {
+                            'entry_time': self.df.index[entry_idx],
+                            'exit_time': self.df.index[i],
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'liquidation_price': liquidation_price,
+                            'position_size': position_size,
+                            'pnl': pnl,
+                            'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
+                            'exit_reason': 'Trailing Stop (momentum)',
+                            'duration_candles': i - entry_idx,
+                            'entry_type': entry_type
+                        }
+                    
+                    # Verificar reversión de momentum
+                    if self.detect_momentum_reversal(i, direction):
+                        exit_price = current_price
+                        pnl = (entry_price - exit_price) * position_size
+                        return {
+                            'entry_time': self.df.index[entry_idx],
+                            'exit_time': self.df.index[i],
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'liquidation_price': liquidation_price,
+                            'position_size': position_size,
+                            'pnl': pnl,
+                            'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
+                            'exit_reason': 'Reversión de Momentum',
+                            'duration_candles': i - entry_idx,
+                            'entry_type': entry_type
+                        }
+            
+            # Gestión estándar para todas las posiciones
             if direction == 'LONG':
                 # VERIFICAR LIQUIDACIÓN PRIMERO (más crítico que stop loss)
                 if candle['low'] <= liquidation_price:
@@ -481,7 +689,8 @@ class HybridTradingBacktest:
                         'pnl': pnl,
                         'pnl_pct': -100,  # Pérdida total del margen
                         'exit_reason': exit_reason,
-                        'duration_candles': i - entry_idx
+                        'duration_candles': i - entry_idx,
+                        'entry_type': entry_type
                     }
                 
                 # Verificar stop loss
@@ -502,7 +711,8 @@ class HybridTradingBacktest:
                         'pnl': pnl,
                         'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
                         'exit_reason': exit_reason,
-                        'duration_candles': i - entry_idx
+                        'duration_candles': i - entry_idx,
+                        'entry_type': entry_type
                     }
                 
                 # Verificar take profit
@@ -523,7 +733,8 @@ class HybridTradingBacktest:
                         'pnl': pnl,
                         'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
                         'exit_reason': exit_reason,
-                        'duration_candles': i - entry_idx
+                        'duration_candles': i - entry_idx,
+                        'entry_type': entry_type
                     }
             
             else:  # SHORT
@@ -545,7 +756,8 @@ class HybridTradingBacktest:
                         'pnl': pnl,
                         'pnl_pct': -100,
                         'exit_reason': exit_reason,
-                        'duration_candles': i - entry_idx
+                        'duration_candles': i - entry_idx,
+                        'entry_type': entry_type
                     }
                 
                 # Verificar stop loss
@@ -566,7 +778,8 @@ class HybridTradingBacktest:
                         'pnl': pnl,
                         'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
                         'exit_reason': exit_reason,
-                        'duration_candles': i - entry_idx
+                        'duration_candles': i - entry_idx,
+                        'entry_type': entry_type
                     }
                 
                 # Verificar take profit
@@ -587,7 +800,8 @@ class HybridTradingBacktest:
                         'pnl': pnl,
                         'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
                         'exit_reason': exit_reason,
-                        'duration_candles': i - entry_idx
+                        'duration_candles': i - entry_idx,
+                        'entry_type': entry_type
                     }
         
         # Si llegamos aquí, el trade alcanzó el límite de tiempo o fin de datos
@@ -622,7 +836,8 @@ class HybridTradingBacktest:
             'pnl': pnl,
             'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
             'exit_reason': exit_reason,
-            'duration_candles': last_available_idx - entry_idx
+            'duration_candles': last_available_idx - entry_idx,
+            'entry_type': entry_type
         }
     
     def run_backtest(self, risk_per_trade: float = 0.10, days: int = 30):
@@ -669,15 +884,34 @@ class HybridTradingBacktest:
                 
                 if direction:
                     entry_price = self.df.iloc[i]['close']
-                    stop_loss = self.calculate_stop_loss(entry_price, direction, i)
                     
-                    # Verificar si es primer trade de la mañana
-                    is_morning = current_time.time() < time(12, 0)
-                    is_first = daily_first_trade and is_morning
+                    # Determinar tipo de entrada
+                    is_momentum = direction.endswith('_MOMENTUM')
+                    if is_momentum:
+                        direction_clean = direction.replace('_MOMENTUM', '')
+                        entry_type = 'momentum'
+                    else:
+                        direction_clean = direction
+                        entry_type = 'mean_reversion'
                     
-                    take_profit = self.calculate_take_profit(
-                        entry_price, direction, is_first, i
-                    )
+                    # Stop loss y take profit ajustados para momentum
+                    if entry_type == 'momentum':
+                        if direction_clean == 'LONG':
+                            stop_loss = entry_price - entry_price * 0.025  # 2.5% SL (más amplio)
+                            take_profit = entry_price + entry_price * 0.05  # 5% TP (más ambicioso)
+                        else:
+                            stop_loss = entry_price + entry_price * 0.028  # 2.8% SL (más amplio)
+                            take_profit = entry_price - entry_price * 0.045  # 4.5% TP (más ambicioso)
+                    else:
+                        stop_loss = self.calculate_stop_loss(entry_price, direction_clean, i)
+                        
+                        # Verificar si es primer trade de la mañana
+                        is_morning = current_time.time() < time(12, 0)
+                        is_first = daily_first_trade and is_morning
+                        
+                        take_profit = self.calculate_take_profit(
+                            entry_price, direction_clean, is_first, i
+                        )
                     
                     # Calcular tamaño de posición para FUTUROS con 15x
                     # Riesgo configurado como porcentaje del balance
@@ -689,8 +923,8 @@ class HybridTradingBacktest:
                     
                     # Simular el trade
                     trade = self.simulate_trade(
-                        i, direction, entry_price, stop_loss, 
-                        take_profit, position_size
+                        i, direction_clean, entry_price, stop_loss, 
+                        take_profit, position_size, entry_type
                     )
                     
                     # Actualizar balance
