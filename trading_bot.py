@@ -176,9 +176,9 @@ class HybridFuturesTradingBot:
         ws_trades.column_dimensions['L'].width = 12
         ws_trades.column_dimensions['M'].width = 10
         ws_trades.column_dimensions['N'].width = 10
-        ws_trades.column_dimensions['O'].width = 15
+        ws_trades.column_dimensions['O'].width = 20 # Razón Salida
         ws_trades.column_dimensions['P'].width = 15
-        ws_trades.column_dimensions['Q'].width = 10
+        ws_trades.column_dimensions['Q'].width = 12 # Balance
         
         # Hoja 2: Resumen
         ws_summary = wb.create_sheet("Resumen")
@@ -303,6 +303,20 @@ class HybridFuturesTradingBot:
         )
         await self.send_telegram_message(message)
 
+    async def notify_filtered_long_signal(self, price: float, idx: int) -> None:
+        """Notificar señal LONG filtrada por horario."""
+        current = self.df.iloc[idx]
+        message = (
+            f"⚠️ <b>SEÑAL LONG (FUERA DE HORARIO)</b> ⚠️\n\n"
+            f"<i>Esta señal fue detectada pero no se operará por estar fuera del horario permitido (8:00-20:00).</i>\n\n"
+            f"📊 Par: {self.symbol}\n"
+            f"📈 Dirección: <b>LONG</b>\n"
+            f"💰 Precio: ${price:.4f}\n"
+            f"📉 RSI: {current['rsi']:.2f}\n"
+            f"⏰ Hora: {self.df.index[idx].strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        await self.send_telegram_message(message)
+
     async def notify_entry(self, position: Position) -> None:
         """Notificar apertura de posición."""
         pnl_target = position.margin_used * (self.take_profit_percent_long if position.direction == 'LONG' else self.take_profit_percent_short) * self.leverage
@@ -310,7 +324,7 @@ class HybridFuturesTradingBot:
         message = (
             f"✅ <b>POSICIÓN ABIERTA</b>\n\n"
             f"📊 Par: {self.symbol}\n"
-            f"📈 Dirección: <b>{position.direction}</b>\n"
+            f"📈 Dirección: <b>{position.direction} ({position.entry_type.upper()})</b>\n"
             f"💰 Precio entrada: ${position.entry_price:.4f}\n"
             f"📏 Tamaño: {position.size:.4f}\n"
             f"💵 Margen usado: ${position.margin_used:.2f}\n"
@@ -446,7 +460,7 @@ class HybridFuturesTradingBot:
         volume_window = self.df.iloc[max(0, idx - 20):idx]
         
         # Calcular cambio de precio en la ventana
-        price_change_pct = ((current['close'] - recent['close'].iloc[0]) / recent['close'].iloc[0]) * 100
+        price_change_pct = ((current['close'] - recent['open'].iloc[0]) / recent['open'].iloc[0]) * 100
         
         # Volumen promedio
         avg_volume = volume_window['volume'].mean()
@@ -457,61 +471,71 @@ class HybridFuturesTradingBot:
         
         # CAÍDA FUERTE (entrada LONG siguiendo la caída)
         if price_change_pct <= -self.momentum_threshold_pct and strong_volume:
-            # Verificar que está cayendo activamente
             bearish_candles = sum(1 for i in range(len(recent)) if recent['close'].iloc[i] < recent['open'].iloc[i])
-            if bearish_candles >= 2:
-                # NUEVA LÓGICA: Entrar DURANTE la caída, no esperar reversión
-                # Solo verificar que no está en rebote fuerte
-                if current['rsi'] < 45:  # Sobrevendido o neutral bajo
-                    # Verificar que la caída continúa (vela actual también bajista o neutral)
-                    if current['close'] <= recent['close'].iloc[-2]:  # Precio sigue bajando
-                        logger.info(f"🔥 MOMENTUM BAJISTA DETECTADO: Caída {price_change_pct:.2f}% - Entrada LONG siguiendo caída")
-                        return 'LONG_MOMENTUM'
+            if bearish_candles >= 2 and current['rsi'] < 45:
+                logger.info(f"🔥 MOMENTUM BAJISTA DETECTADO: Caída {price_change_pct:.2f}% - Entrada LONG siguiendo caída")
+                return 'LONG_MOMENTUM'
         
         # SUBIDA FUERTE (entrada SHORT siguiendo la subida)
         elif price_change_pct >= self.momentum_threshold_pct and strong_volume:
-            # Verificar que está subiendo activamente
             bullish_candles = sum(1 for i in range(len(recent)) if recent['close'].iloc[i] > recent['open'].iloc[i])
-            if bullish_candles >= 2:
-                # NUEVA LÓGICA: Entrar DURANTE la subida, no esperar reversión
-                if current['rsi'] > 55:  # Sobrecomprado o neutral alto
-                    # Verificar que la subida continúa
-                    if current['close'] >= recent['close'].iloc[-2]:  # Precio sigue subiendo
-                        logger.info(f"🔥 MOMENTUM ALCISTA DETECTADO: Subida {price_change_pct:.2f}% - Entrada SHORT siguiendo subida")
-                        return 'SHORT_MOMENTUM'
+            if bullish_candles >= 2 and current['rsi'] > 55:
+                logger.info(f"🔥 MOMENTUM ALCISTA DETECTADO: Subida {price_change_pct:.2f}% - Entrada SHORT siguiendo subida")
+                return 'SHORT_MOMENTUM'
         
         return None
     
+    # ----------------------------------------------------------------------------------
+    # LÓGICA DE SALIDA PARA MOMENTUM (CORREGIDA)
+    # ----------------------------------------------------------------------------------
     def detect_momentum_reversal(self, idx: int) -> bool:
-        """Detecta si el momentum se está revirtiendo para cerrar la posición."""
+        """
+        Detecta si la idea de reversión de momentum falló.
+        Cierra la posición si el momentum original continúa con fuerza.
+        """
         if not self.position or self.position.entry_type != 'momentum':
             return False
         
+        # Período de gracia: no tomar decisiones en las primeras 2 velas
+        candles_elapsed = idx - self.position.entry_idx
+        if candles_elapsed < 2:
+            return False
+        
         current = self.df.iloc[idx]
-        prev = self.df.iloc[idx - 1] if idx > 0 else current
+        prev = self.df.iloc[idx - 1]
         
         if self.position.direction == 'LONG':
-            # Cerrar LONG si detecta reversión bajista
-            reversal_signals = [
-                current['close'] < current['ema_9'],  # Precio bajo EMA rápida
-                current['ema_9'] < current['ema_21'],  # Cruce bajista
-                current['macd_hist'] < prev['macd_hist'],  # MACD perdiendo fuerza
-                current['close'] < current['open'],  # Vela bajista
-                current['rsi'] > 65  # Sobrecomprado
-            ]
-            return sum(reversal_signals) >= 3
-        
-        else:  # SHORT
-            # Cerrar SHORT si detecta reversión alcista
-            reversal_signals = [
-                current['close'] > current['ema_9'],  # Precio sobre EMA rápida
-                current['ema_9'] > current['ema_21'],  # Cruce alcista
-                current['macd_hist'] > prev['macd_hist'],  # MACD ganando fuerza
-                current['close'] > current['open'],  # Vela alcista
-                current['rsi'] < 35  # Sobrevendido
-            ]
-            return sum(reversal_signals) >= 3
-    
+            # La entrada LONG fue por una CAÍDA brusca.
+            # Cerramos si la caída continúa, indicando que la reversión falló.
+            
+            # Condición 1: El precio hace un nuevo mínimo más bajo que la vela de entrada.
+            entry_candle = self.df.iloc[self.position.entry_idx]
+            failed_reversal = current['low'] < entry_candle['low']
+            
+            # Condición 2: El MACD muestra que el momentum bajista se acelera de nuevo.
+            strengthening_downtrend = current['macd_hist'] < prev['macd_hist'] and current['macd_hist'] < 0
+
+            if failed_reversal and strengthening_downtrend:
+                logger.warning("Reversión de Momentum (LONG): La caída continuó. Cerrando posición.")
+                return True
+
+        elif self.position.direction == 'SHORT':
+            # La entrada SHORT fue por una SUBIDA brusca.
+            # Cerramos si la subida continúa, indicando que la reversión falló.
+            
+            # Condición 1: El precio hace un nuevo máximo más alto que la vela de entrada.
+            entry_candle = self.df.iloc[self.position.entry_idx]
+            failed_reversal = current['high'] > entry_candle['high']
+            
+            # Condición 2: El MACD muestra que el momentum alcista se acelera de nuevo.
+            strengthening_uptrend = current['macd_hist'] > prev['macd_hist'] and current['macd_hist'] > 0
+
+            if failed_reversal and strengthening_uptrend:
+                logger.warning("Reversión de Momentum (SHORT): La subida continuó. Cerrando posición.")
+                return True
+                
+        return False
+
     # ----------------------------------------------------------------------------------
     # Reglas de señal idénticas al backtest
     # ----------------------------------------------------------------------------------
@@ -626,7 +650,7 @@ class HybridFuturesTradingBot:
 
         return True
 
-    def analyze_market_direction(self, idx: int) -> Optional[str]:
+    async def analyze_market_direction(self, idx: int) -> Optional[str]:
         if idx < 200:
             return None
 
@@ -642,8 +666,12 @@ class HybridFuturesTradingBot:
         if self.detect_mean_reversion_long(idx):
             if self.is_long_trading_hours(current_time):
                 return 'LONG'
-            self.filtered_long_signals += 1
-            return None
+            else:
+                # Si está fuera de horario, notificar pero no operar
+                self.filtered_long_signals += 1
+                current_price = self.df.iloc[idx]['close']
+                await self.notify_filtered_long_signal(current_price, idx)
+                return None
 
         if self.detect_mean_reversion_short_improved(idx) and self.add_short_quality_filter(idx):
             return 'SHORT'
@@ -824,24 +852,19 @@ class HybridFuturesTradingBot:
                 # Activar trailing stop si hay ganancia suficiente
                 if profit_pct >= self.trailing_stop_activation_pct:
                     # Calcular nuevo trailing stop
-                    max_price = max(current_candle['high'], self.position.entry_price * (1 + profit_pct / 100))
-                    new_trailing = max_price * (1 - self.trailing_stop_distance_pct / 100)
+                    max_price_since_entry = self.df['high'].iloc[self.position.entry_idx:idx+1].max()
+                    new_trailing = max_price_since_entry * (1 - self.trailing_stop_distance_pct / 100)
                     
                     # Actualizar trailing stop (solo sube, nunca baja)
                     if self.position.trailing_stop is None or new_trailing > self.position.trailing_stop:
                         self.position.trailing_stop = new_trailing
-                        logger.info(f"📈 Trailing stop actualizado: ${new_trailing:.4f} (ganancia: {profit_pct:.2f}%)")
+                        logger.info(f"📈 Trailing stop LONG actualizado: ${new_trailing:.4f} (ganancia: {profit_pct:.2f}%)")
                 
                 # Verificar trailing stop
                 if self.position.trailing_stop and current_candle['low'] <= self.position.trailing_stop:
                     await self.close_position(self.position.trailing_stop, 'Trailing Stop (momentum)')
                     return
                 
-                # Verificar reversión de momentum
-                if self.detect_momentum_reversal(idx):
-                    await self.close_position(current_price, 'Reversión de Momentum')
-                    return
-            
             else:  # SHORT
                 # Calcular ganancia actual
                 profit_pct = ((self.position.entry_price - current_price) / self.position.entry_price) * 100
@@ -849,24 +872,24 @@ class HybridFuturesTradingBot:
                 # Activar trailing stop si hay ganancia suficiente
                 if profit_pct >= self.trailing_stop_activation_pct:
                     # Calcular nuevo trailing stop
-                    min_price = min(current_candle['low'], self.position.entry_price * (1 - profit_pct / 100))
-                    new_trailing = min_price * (1 + self.trailing_stop_distance_pct / 100)
+                    min_price_since_entry = self.df['low'].iloc[self.position.entry_idx:idx+1].min()
+                    new_trailing = min_price_since_entry * (1 + self.trailing_stop_distance_pct / 100)
                     
                     # Actualizar trailing stop (solo baja, nunca sube)
                     if self.position.trailing_stop is None or new_trailing < self.position.trailing_stop:
                         self.position.trailing_stop = new_trailing
-                        logger.info(f"📉 Trailing stop actualizado: ${new_trailing:.4f} (ganancia: {profit_pct:.2f}%)")
+                        logger.info(f"📉 Trailing stop SHORT actualizado: ${new_trailing:.4f} (ganancia: {profit_pct:.2f}%)")
                 
                 # Verificar trailing stop
                 if self.position.trailing_stop and current_candle['high'] >= self.position.trailing_stop:
                     await self.close_position(self.position.trailing_stop, 'Trailing Stop (momentum)')
                     return
-                
-                # Verificar reversión de momentum
-                if self.detect_momentum_reversal(idx):
-                    await self.close_position(current_price, 'Reversión de Momentum')
-                    return
-        
+            
+            # Verificar si la idea de reversión de momentum falló
+            if self.detect_momentum_reversal(idx):
+                await self.close_position(current_price, 'Reversión de Momentum')
+                return
+
         # Gestión estándar para todas las posiciones
         if self.position.direction == 'LONG':
             if current_candle['low'] <= self.position.liquidation_price:
@@ -879,7 +902,7 @@ class HybridFuturesTradingBot:
                 await self.close_position(self.position.take_profit, 'Take Profit (simulado)')
                 return
 
-        else:
+        else: # SHORT
             if current_candle['high'] >= self.position.liquidation_price:
                 await self.close_position(self.position.liquidation_price, 'LIQUIDACIÓN (simulada)')
                 return
@@ -893,8 +916,52 @@ class HybridFuturesTradingBot:
     # ----------------------------------------------------------------------------------
     # Bucle principal
     # ----------------------------------------------------------------------------------
+    # <<<< NUEVA FUNCIÓN >>>>
+    async def perform_startup_checks(self) -> bool:
+        """Realiza comprobaciones de conexión al iniciar y notifica por Telegram."""
+        logger.info("Realizando comprobaciones de inicio...")
+
+        # 1. Probar conexión con Telegram
+        try:
+            await self.send_telegram_message("⏳ <b>Iniciando Bot</b>\n\nRealizando pruebas de conexión...")
+            logger.info("✅ Conexión con Telegram exitosa.")
+        except Exception as e:
+            logger.error(f"❌ FALLO CRÍTICO: No se pudo conectar con Telegram. Error: {e}")
+            logger.error("El bot no puede enviar notificaciones. Comprueba el telegram_token y telegram_chat_id.")
+            return False
+
+        # 2. Probar conexión y descarga de datos de Binance
+        try:
+            df = await self.fetch_candles()
+            if df is None or df.empty:
+                raise ValueError("El DataFrame de velas está vacío o no se pudo descargar.")
+            
+            logger.info("✅ Conexión con Binance y descarga de datos exitosa.")
+            await self.send_telegram_message(
+                "✅ <b>Pruebas Superadas</b>\n\n"
+                "- Conexión con Telegram: OK\n"
+                "- Conexión con Binance: OK\n\n"
+                "🚀 El bot está operativo."
+            )
+            return True
+        except Exception as e:
+            logger.error(f"❌ FALLO CRÍTICO: No se pudo descargar datos de Binance. Error: {e}")
+            await self.send_telegram_message(
+                "❌ <b>ERROR CRÍTICO</b> ❌\n\n"
+                "No se pudo descargar la información de mercado de Binance.\n"
+                "El bot no puede continuar. Revisa la consola para más detalles."
+            )
+            return False
+
     async def run(self) -> None:
         """Ejecutar el ciclo principal del bot."""
+
+        # <<<< SECCIÓN DE COMPROBACIÓN AÑADIDA >>>>
+        startup_ok = await self.perform_startup_checks()
+        if not startup_ok:
+            logger.error("Las comprobaciones de inicio fallaron. El bot se detendrá.")
+            self.stop()
+            return  # Detiene la ejecución si las pruebas fallan
 
         self.is_running = True
         logger.info("=== Iniciando Hybrid Futures Trading Bot (15x) ===")
@@ -922,7 +989,7 @@ class HybridFuturesTradingBot:
                     self.daily_first_trade = True
                     self.last_trade_date = current_date
 
-                direction = self.analyze_market_direction(idx)
+                direction = await self.analyze_market_direction(idx)
 
                 if direction and (self.last_signal_time is None or current_time > self.last_signal_time):
                     await self.open_position(direction, idx)

@@ -5,7 +5,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 TELEGRAM_TOKEN = "7738692166:AAHPBKWUVM8gcYldRojnFCWnOKwidfXL2cY"
-TELEGRAM_CHAT_ID = "6670799737"
+TELEGRAM_CHAT_ID = "-1002950990699"
 
 async def test_telegram():
     """Probar conexión con Telegram."""
