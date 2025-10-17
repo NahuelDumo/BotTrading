@@ -947,7 +947,7 @@ class HybridTradingBacktest:
                         stop_loss = self.calculate_stop_loss(entry_price, direction_clean, i)
                         
                         # Verificar si es primer trade de la mañana
-                        is_morning = current_time.time() < time(12, 0)
+                        is_morning = current_time.time() < time(15, 0)
                         is_first = daily_first_trade and is_morning
                         
                         take_profit = self.calculate_take_profit(
@@ -1453,7 +1453,7 @@ def main():
     # Configuración
     symbol = 'HYPE/USDT'
     initial_balance = 100  # Balance inicial en USDT
-    risk_per_trade = 0.10  # 10% del capital por trade (margen)
+    risk_per_trade = 0.02  # 10% del capital por trade (margen)
     days = 120  # Días de historia para backtest
     
     print("="*70)
@@ -1462,7 +1462,7 @@ def main():
     print("Configuración:")
     print("• Symbol: HYPE/USDT")
     print("• Apalancamiento: 15x")
-    print("• Margen por trade: 10%")
+    print("• Margen por trade: 2%")
     print("• Stop Loss Long: 1.2% | Short: 1.5%")
     print("• Take Profit Long: 3.0% | Short: 2.2%")
     print("• Límite tiempo Long: 60 velas (5h) | Short: 45 velas (3.75h)")

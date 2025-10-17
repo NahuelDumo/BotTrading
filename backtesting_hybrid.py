@@ -46,7 +46,7 @@ class HybridTradingBacktest:
         self.stop_loss_percent_long = 0.012   # 1.2% para LONGs
         self.stop_loss_percent_short = 0.015  # 1.5% para SHORTs
         
-        self.take_profit_percent_long = 0.03   # 3% para LONGs
+        self.take_profit_percent_long = 0.02   # 2% para LONGs
         self.take_profit_percent_short = 0.022 # 2.2% para SHORTs (más conservador)
         
         # Límites de tiempo diferenciados
@@ -186,70 +186,63 @@ class HybridTradingBacktest:
             return None
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # EMA
+        """Calcular los mismos indicadores que en el backtest."""
+
+        df = df.copy()
+
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['ema_15'] = df['close'].ewm(span=15, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema_25'] = df['close'].ewm(span=25, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
         df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
-        
-        # RSI
+
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
         df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # MACD
+
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = exp1 - exp2
         df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
         df['macd_hist'] = df['macd'] - df['macd_signal']
-        
-        # ATR
+
         high_low = df['high'] - df['low']
         high_close = np.abs(df['high'] - df['close'].shift())
         low_close = np.abs(df['low'] - df['close'].shift())
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
         df['atr'] = true_range.rolling(14).mean()
-        
-        # Bollinger Bands
+
         df['bb_middle'] = df['close'].rolling(window=20).mean()
         df['bb_std'] = df['close'].rolling(window=20).std()
         df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
         df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
-        
-        # =================================================================
-        # ===== CÁLCULO DEL ADX (CON CORRECCIÓN) =====
-        # =================================================================
-        period = 14 # Período estándar para el ADX
+
+        # ===== INICIO: LÓGICA DE ADX (FALTANTE EN EL BOT) =====
+        period = 14
         
         df['tr'] = (df['high'] - df['low']).combine_first(abs(df['high'] - df['close'].shift(1))).combine_first(abs(df['low'] - df['close'].shift(1)))
         
         df['plus_dm'] = np.where((df['high'] - df['high'].shift(1)) > (df['low'].shift(1) - df['low']), df['high'] - df['high'].shift(1), 0)
         df['minus_dm'] = np.where((df['low'].shift(1) - df['low']) > (df['high'] - df['high'].shift(1)), df['low'].shift(1) - df['low'], 0)
 
-        # Suavizado
         atr_adx = df['tr'].ewm(alpha=1/period, adjust=False).mean()
         plus_di = 100 * (df['plus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr_adx)
         minus_di = 100 * (df['minus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr_adx)
         
-        # --- LÍNEA CORREGIDA PARA EVITAR DIVISIÓN POR CERO --- 🛡️
         sum_di = plus_di + minus_di
         df['dx'] = np.where(sum_di == 0, 0, 100 * (abs(plus_di - minus_di) / sum_di))
         
         df['adx'] = df['dx'].ewm(alpha=1/period, adjust=False).mean()
         
-        # Guardamos DI+ y DI- porque los usaremos en el filtro
         df['plus_di'] = plus_di
         df['minus_di'] = minus_di
 
-        # Limpiamos las columnas auxiliares que ya no necesitamos
         df.drop(['tr', 'plus_dm', 'minus_dm', 'dx'], axis=1, inplace=True)
-        # =================================================================
-        
+        # ===== FIN: LÓGICA DE ADX =====
+
         return df
     
     def is_long_trading_hours(self, timestamp) -> bool:
@@ -302,91 +295,69 @@ class HybridTradingBacktest:
 
         # Detectar sobreventa con confirmaciones actualizadas
         oversold_conditions = [
-            current['ema_9'] < current['ema_21'],                     # Retroceso de corto plazo
-            current['close'] < current['ema_21'],                     # Precio por debajo de EMA media
-            current['rsi'] < 35,                                      # RSI en sobreventa
-            current['macd'] < current['macd_signal'],                 # MACD aún bajista
-            current['macd_hist'] > prev['macd_hist'],                 # Momentum recuperándose
-            current['volume'] >= volume_mean * 1.1,                   # Confirmación de volumen
-            current['close'] >= current['ema_200'] * 0.99             # Mantenerse cerca de EMA 200
+            current['ema_25'] > current['ema_50'],              # CORREGIDO: EMA de 25 por encima de EMA de 50
+            current['close'] < current['ema_21'],               # Precio por debajo de EMA media
+            current['macd'] < current['macd_signal'],           # MACD aún bajista
+            current['macd_hist'] > prev['macd_hist'],           # Momentum recuperándose
+            current['close'] >= current['ema_200'] * 0.99       # Mantenerse cerca de EMA 200
         ]
 
         return sum(oversold_conditions) >= 5
     
     def detect_mean_reversion_short_improved(self, idx: int) -> bool:
-        """
-        Detectar señal SHORT MEJORADO - Versión MÁS PERMISIVA
-        """
         if idx < 200:
             return False
-        
-        current = self.df.iloc[idx]
 
-        # =================================================================
-        # ===== NUEVO: ESCUDO DEFENSIVO CONTRA IMPULSOS FUERTES (ADX) =====
-        # =================================================================
-        # Condición: Si el ADX es > 25 (tendencia fuerte) Y
-        # el movimiento es claramente alcista (DI+ > DI-),
-        # entonces NO ABRIMOS SHORT. Es demasiado peligroso.
-        if current['adx'] > 25 and current['plus_di'] > current['minus_di']:
-            self.filtered_short_signals += 1 # Contamos como señal filtrada
-            return False # ¡DETENEMOS LA OPERACIÓN AQUÍ!
-        # =================================================================
+        current = self.df.iloc[idx]
         
+        # ===== INICIO: ESCUDO DEFENSIVO ADX (FALTANTE EN EL BOT) =====
+        # Si la tendencia es fuerte (ADX > 25) y alcista (DI+ > DI-), no abrir SHORT.
+        if current.get('adx', 0) > 25 and current.get('plus_di', 0) > current.get('minus_di', 0):
+            self.filtered_short_signals += 1
+            return False
+        # ===== FIN: ESCUDO DEFENSIVO ADX =====
+
         prev = self.df.iloc[idx - 1]
-        recent = self.df.iloc[max(0, idx-20):idx]
-        recent_longer = self.df.iloc[max(0, idx-50):idx]
-        
-        # FILTRO 1: Contexto alcista (MÁS FLEXIBLE)
+        recent = self.df.iloc[max(0, idx - 20):idx]
+        recent_longer = self.df.iloc[max(0, idx - 50):idx]
+
         uptrend_context = [
             current['ema_9'] > current['ema_21'],
             current['close'] > current['ema_50'],
             recent_longer['close'].iloc[-1] > recent_longer['close'].iloc[0]
         ]
-        
-        # Solo requiere 1 de 3 (antes era 2 de 3)
+
         if sum(uptrend_context) < 1:
             self.filtered_short_signals += 1
             return False
-        
-        # CONDICIÓN CRÍTICA: Precio cerca de BB upper (MÁS PERMISIVO)
+
         bb_distance = (current['close'] - current['bb_upper']) / current['bb_upper'] * 100
-        near_bb_upper = bb_distance > -1.0  # Puede estar hasta 1% debajo (antes -0.5%)
-        
+        near_bb_upper = bb_distance > -1.0
         if not near_bb_upper:
             return False
-        
-        # PATRÓN DE VELA: MÁS FLEXIBLE
+
         candle_range = current['high'] - current['low']
         if candle_range == 0:
             return False
-        
+
         close_position = (current['close'] - current['low']) / candle_range
-        
-        # Acepta cualquier vela que no cierre en el 70% superior
-        has_bearish_pattern = close_position < 0.7  # Antes era 0.6
-        
+        has_bearish_pattern = close_position < 0.7
         if not has_bearish_pattern:
             return False
-        
+
         volume_mean = recent['volume'].mean()
-        
-        # CONDICIONES MÁS PERMISIVAS
         short_conditions = [
-            current['rsi'] > 65,                                      # Bajado de 70
-            bb_distance > -0.8,                                       # Más permisivo
-            current['close'] > current['ema_9'],                      
-            current['macd'] > current['macd_signal'],                 
-            current['macd_hist'] < prev['macd_hist'],                 
-            current['volume'] > volume_mean * 1.05,                   # Bajado de 1.15
-            current['high'] >= recent['high'].tail(10).max(),         # Solo últimas 10 velas
-            (current['close'] - current['ema_50']) / current['ema_50'] * 100 > 0.5  # Bajado de 1.0
+            current['rsi'] > 65,
+            bb_distance > -0.8,
+            current['close'] > current['ema_9'],
+            current['macd'] > current['macd_signal'],
+            current['macd_hist'] < prev['macd_hist'],
+            current['volume'] > volume_mean * 1.05,
+            current['high'] >= recent['high'].tail(10).max(),
+            (current['close'] - current['ema_50']) / current['ema_50'] * 100 > 0.5
         ]
-        
-        score = sum(short_conditions)
-        
-        # Requiere 4 de 8 (antes era 5 de 8)
-        return score >= 4
+
+        return sum(short_conditions) >= 4
 
     def add_short_quality_filter(self, idx: int) -> bool:
         """
@@ -427,70 +398,34 @@ class HybridTradingBacktest:
         recent = self.df.iloc[idx - self.momentum_candles_window:idx + 1]
         volume_window = self.df.iloc[max(0, idx - 20):idx]
         
-        # Calcular cambio de precio en la ventana
+        # CORRECCIÓN 1: Calcular cambio de precio desde el 'close' anterior, no el 'open'
         price_change_pct = ((current['close'] - recent['close'].iloc[0]) / recent['close'].iloc[0]) * 100
         
-        # Volumen promedio
         avg_volume = volume_window['volume'].mean()
         current_volume = current['volume']
         
-        # Verificar volumen fuerte
         strong_volume = current_volume >= avg_volume * self.momentum_volume_multiplier
         
-        # CAÍDA FUERTE (entrada LONG siguiendo la caída)
+        # CAÍDA FUERTE (entrada LONG)
         if price_change_pct <= -self.momentum_threshold_pct and strong_volume:
-            # Verificar que está cayendo activamente
             bearish_candles = sum(1 for i in range(len(recent)) if recent['close'].iloc[i] < recent['open'].iloc[i])
-            if bearish_candles >= 2:
-                # NUEVA LÓGICA: Entrar DURANTE la caída, no esperar reversión
-                # Solo verificar que no está en rebote fuerte
-                if current['rsi'] < 45:  # Sobrevendido o neutral bajo
-                    # Verificar que la caída continúa (vela actual también bajista o neutral)
-                    if current['close'] <= recent['close'].iloc[-2]:  # Precio sigue bajando
-                        return 'LONG_MOMENTUM'
+            if bearish_candles >= 2 and current['rsi'] < 45:
+                # CORRECCIÓN 2: Añadir confirmación de que el precio sigue bajando
+                if current['close'] <= recent['close'].iloc[-2]:
+                    logger.info(f"🔥 MOMENTUM BAJISTA DETECTADO: Caída {price_change_pct:.2f}% - Entrada LONG siguiendo caída")
+                    return 'LONG_MOMENTUM'
         
-        # SUBIDA FUERTE (entrada SHORT siguiendo la subida)
+        # SUBIDA FUERTE (entrada SHORT)
         elif price_change_pct >= self.momentum_threshold_pct and strong_volume:
-            # Verificar que está subiendo activamente
             bullish_candles = sum(1 for i in range(len(recent)) if recent['close'].iloc[i] > recent['open'].iloc[i])
-            if bullish_candles >= 2:
-                # NUEVA LÓGICA: Entrar DURANTE la subida, no esperar reversión
-                if current['rsi'] > 55:  # Sobrecomprado o neutral alto
-                    # Verificar que la subida continúa
-                    if current['close'] >= recent['close'].iloc[-2]:  # Precio sigue subiendo
-                        return 'SHORT_MOMENTUM'
+            if bullish_candles >= 2 and current['rsi'] > 55:
+                # CORRECCIÓN 2: Añadir confirmación de que el precio sigue subiendo
+                if current['close'] >= recent['close'].iloc[-2]:
+                    logger.info(f"🔥 MOMENTUM ALCISTA DETECTADO: Subida {price_change_pct:.2f}% - Entrada SHORT siguiendo subida")
+                    return 'SHORT_MOMENTUM'
         
         return None
     
-    def detect_momentum_reversal(self, idx: int, direction: str) -> bool:
-        """Detecta si el momentum se está revirtiendo para cerrar la posición."""
-        if idx < 1:
-            return False
-        
-        current = self.df.iloc[idx]
-        prev = self.df.iloc[idx - 1]
-        
-        if direction == 'LONG':
-            # Cerrar LONG si detecta reversión bajista
-            reversal_signals = [
-                current['close'] < current['ema_9'],  # Precio bajo EMA rápida
-                current['ema_9'] < current['ema_21'],  # Cruce bajista
-                current['macd_hist'] < prev['macd_hist'],  # MACD perdiendo fuerza
-                current['close'] < current['open'],  # Vela bajista
-                current['rsi'] > 65  # Sobrecomprado
-            ]
-            return sum(reversal_signals) >= 3
-        
-        else:  # SHORT
-            # Cerrar SHORT si detecta reversión alcista
-            reversal_signals = [
-                current['close'] > current['ema_9'],  # Precio sobre EMA rápida
-                current['ema_9'] > current['ema_21'],  # Cruce alcista
-                current['macd_hist'] > prev['macd_hist'],  # MACD ganando fuerza
-                current['close'] > current['open'],  # Vela alcista
-                current['rsi'] < 35  # Sobrevendido
-            ]
-            return sum(reversal_signals) >= 3
     
     def analyze_market_direction(self, idx: int) -> str:
         """
@@ -567,8 +502,8 @@ class HybridTradingBacktest:
             return entry_price - tp_distance
     
     def simulate_trade(self, entry_idx: int, direction: str, entry_price: float,
-                      stop_loss: float, take_profit: float, position_size: float, 
-                      entry_type: str = 'mean_reversion') -> Dict:
+                       stop_loss: float, take_profit: float, position_size: float, 
+                       entry_type: str = 'mean_reversion') -> Dict:
         """
         Simular un trade de FUTUROS desde la entrada hasta la salida
         Incluye verificación de liquidación con apalancamiento 15x
@@ -632,27 +567,6 @@ class HybridTradingBacktest:
                             'duration_candles': i - entry_idx,
                             'entry_type': entry_type
                         }
-                    
-                    # Verificar reversión de momentum
-                    if self.detect_momentum_reversal(i, direction):
-                        exit_price = current_price
-                        pnl = (exit_price - entry_price) * position_size
-                        return {
-                            'entry_time': self.df.index[entry_idx],
-                            'exit_time': self.df.index[i],
-                            'direction': direction,
-                            'entry_price': entry_price,
-                            'exit_price': exit_price,
-                            'stop_loss': stop_loss,
-                            'take_profit': take_profit,
-                            'liquidation_price': liquidation_price,
-                            'position_size': position_size,
-                            'pnl': pnl,
-                            'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
-                            'exit_reason': 'Reversión de Momentum',
-                            'duration_candles': i - entry_idx,
-                            'entry_type': entry_type
-                        }
                 
                 else:  # SHORT
                     # Actualizar mínimo alcanzado
@@ -684,27 +598,6 @@ class HybridTradingBacktest:
                             'pnl': pnl,
                             'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
                             'exit_reason': 'Trailing Stop (momentum)',
-                            'duration_candles': i - entry_idx,
-                            'entry_type': entry_type
-                        }
-                    
-                    # Verificar reversión de momentum
-                    if self.detect_momentum_reversal(i, direction):
-                        exit_price = current_price
-                        pnl = (entry_price - exit_price) * position_size
-                        return {
-                            'entry_time': self.df.index[entry_idx],
-                            'exit_time': self.df.index[i],
-                            'direction': direction,
-                            'entry_price': entry_price,
-                            'exit_price': exit_price,
-                            'stop_loss': stop_loss,
-                            'take_profit': take_profit,
-                            'liquidation_price': liquidation_price,
-                            'position_size': position_size,
-                            'pnl': pnl,
-                            'pnl_pct': (pnl / (entry_price * position_size / self.leverage)) * 100,
-                            'exit_reason': 'Reversión de Momentum',
                             'duration_candles': i - entry_idx,
                             'entry_type': entry_type
                         }
@@ -880,7 +773,6 @@ class HybridTradingBacktest:
             'duration_candles': last_available_idx - entry_idx,
             'entry_type': entry_type
         }
-    
     def run_backtest(self, risk_per_trade: float = 0.10, days: int = 30):
         """
         Ejecutar backtest completo
@@ -1453,7 +1345,7 @@ def main():
     # Configuración
     symbol = 'HYPE/USDT'
     initial_balance = 100  # Balance inicial en USDT
-    risk_per_trade = 0.10  # 10% del capital por trade (margen)
+    risk_per_trade = 0.1  # 10% del capital por trade (margen)
     days = 120  # Días de historia para backtest
     
     print("="*70)
